@@ -130,6 +130,9 @@ class LatentActionQuantization(nn.Module):
 
         return self.decode(codes)
 
+    def codes_from_codebook_indices(self, indices):
+        return self.vq.codebook[indices]
+
     @property
     def patch_height_width(self):
         return self.image_size[0] // self.patch_size[0], self.image_size[1] // self.patch_size[1]
@@ -203,6 +206,7 @@ class LatentActionQuantization(nn.Module):
         mask = None,
         return_recons_only = False,
         return_only_codebook_ids = False,
+        return_embeddings = False,
     ):
         assert video.ndim in {4, 5}
 
@@ -252,6 +256,9 @@ class LatentActionQuantization(nn.Module):
 
         if return_only_codebook_ids:
             return indices
+
+        if return_embeddings:
+            return tokens
         
         if math.sqrt(self.code_seq_len) % 1 == 0: # "code_seq_len should be square number"
             action_h = int(math.sqrt(self.code_seq_len))
@@ -291,6 +298,7 @@ class LatentActionQuantization(nn.Module):
         step = 0,
         mask = None,
         return_only_codebook_ids=False,
+        return_embeddings=False,
         user_action_token_num=None
     ):
         
@@ -332,6 +340,9 @@ class LatentActionQuantization(nn.Module):
     
         if return_only_codebook_ids:
             return indices
+
+        if return_embeddings:
+            return tokens    
 
         if math.sqrt(self.code_seq_len) % 1 == 0: # "code_seq_len should be square number"
             action_h = int(math.sqrt(self.code_seq_len))
