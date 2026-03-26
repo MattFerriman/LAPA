@@ -1,4 +1,4 @@
-from laq_model import LAQTrainer
+from laq_model import LAQTrainerWithDepth
 from laq_model import LatentActionQuantization
 
 
@@ -14,23 +14,23 @@ laq = LatentActionQuantization(
     dim_head = 64,
     heads = 16,
     code_seq_len=4,
+    channels = 4,
 ).cuda()
 
 
-trainer = LAQTrainer(
+trainer = LAQTrainerWithDepth(
     laq,
     folder = '',
-    offsets = 30,
+    offsets = 5,
     batch_size = 64,
     grad_accum_every = 1,
     train_on_images = False, 
     use_ema = False,          
-    num_train_steps = 1000,
-    results_folder='results',
+    num_train_steps = 30005,
+    results_folder='results_tk1257_mv_depth',
     lr=1e-4,
-    save_model_every=500,
+    save_model_every=5000,
     save_results_every=5000,
 )
 
 trainer.train()        
-

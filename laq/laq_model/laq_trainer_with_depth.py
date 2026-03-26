@@ -20,9 +20,9 @@ from ema_pytorch import EMA
 import json
 import glob
 import os
+import numpy as np
 
 from laq_model.data import ImageVideoDataset, BridgeVideoDataset
-
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
@@ -48,10 +48,23 @@ def accum_log(log, new_logs):
         log[key] = old_value + new_value
     return log
 
+def build_prefix(entry): 
+    p = Path(entry["traj_path"]) 
+    traj_name = p.name 
+    traj_group = p.parent.name 
+    raw_dir = p.parent.parent 
+    date_dir = raw_dir.parent.name 
+    collection_id = raw_dir.parent.parent.name 
+    task_name = raw_dir.parent.parent.parent.name 
+    environment = entry.get("environment", "unknown_env") 
+    
+    return f"{environment}/{task_name}/{collection_id}/{traj_group}/{date_dir}/{traj_name}"
+
+
 # main trainer class
 
 @beartype
-class LAQTrainer(nn.Module):
+class LAQTrainerWithDepth(nn.Module):
     def __init__(
         self,
         vae,
@@ -77,6 +90,7 @@ class LAQTrainer(nn.Module):
         offsets = None,
     ):
         super().__init__()
+
         image_size = vae.image_size
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
@@ -122,16 +136,20 @@ class LAQTrainer(nn.Module):
         # self.ds = ImageVideoDataset(folder, image_size, offset=offsets)
 
         # bridge data v2 training
-        
+
         with open("/rds/general/user/mf822/home/FinalYearProject/LAPA-Testing/train_meta.json", "r") as f:
             train_entries = json.load(f)
 
         with open("/rds/general/user/mf822/home/FinalYearProject/LAPA-Testing/val_meta.json", "r") as f:
             val_entries = json.load(f)
-
+     
         envs = ["toykitchen1", "toykitchen2", "toykitchen5", "toykitchen7"]
         train_entries = [t for t in train_entries if t["environment"] in envs]
         val_entries = [t for t in val_entries if t["environment"] in envs]
+
+        stats = np.load("/rds/general/user/mf822/home/FinalYearProject/LAPA-Testing/depth_stats.npy", allow_pickle=True).item()
+
+        global_depth_stats = (stats["mean_single"], stats["std_single"])
 
         print(f"Train entries: {len(train_entries)}")
         print(f"Val entries: {len(val_entries)}")
@@ -141,14 +159,20 @@ class LAQTrainer(nn.Module):
             offset=offsets,
             traj_entries=train_entries,
             use_multiview=True,
-            altview=True
+            altview=True,
+            use_depth=True,
+            depth_norm="global",
+            global_depth_stats=global_depth_stats
         )
 
         self.valid_ds = BridgeVideoDataset(
             image_size,
             offset=offsets,
             traj_entries=val_entries,
-            use_multiview=True
+            use_multiview=True,
+            use_depth=True,
+            depth_norm="global",
+            global_depth_stats=global_depth_stats
         )
 
         self.dl = DataLoader(
@@ -194,7 +218,6 @@ class LAQTrainer(nn.Module):
 
         self.save_model_every = save_model_every
         self.save_results_every = save_results_every
-
 
         self.results_folder = Path(results_folder)
 
@@ -297,6 +320,8 @@ class LAQTrainer(nn.Module):
             self.ema_vae.update()
 
         if self.is_main and not (steps % self.save_results_every):
+            self.print(f'{steps}: saving to {str(self.results_folder)}')
+
             unwrapped_vae = self.accelerator.unwrap_model(self.vae)
             vaes_to_evaluate = ((unwrapped_vae, str(steps)),)
 
@@ -325,19 +350,60 @@ class LAQTrainer(nn.Module):
                     logs['reconstructions'] = grid
                     save_image(grid, str(self.results_folder / f'{filename}.png'))
                 else:
-                    # imgs_and_recons = torch.stack((valid_data[:,:,0],valid_data[:,:,-1], recons, recons+valid_data[:,:,0]), dim = 0)
-                    imgs_and_recons = torch.stack((valid_data[:,:,0],valid_data[:,:,-1], recons), dim = 0)
-                    # imgs_and_recons = torch.stack((valid_data, recons), dim = 0)
-                    imgs_and_recons = rearrange(imgs_and_recons, 'r b ... -> (b r) ...')
+                    # valid_data shape: (B, C, 2, H, W)
+                    # recons shape:     (B, C, H, W) or similar
+
+                    rgb = valid_data[:, :3]      # (B, 3, 2, H, W)
+                    depth = valid_data[:, 3:4]   # (B, 1, 2, H, W)
+
+                    rgb_t0 = rgb[:, :, 0]
+                    rgb_t1 = rgb[:, :, 1]
+
+                    depth_t0 = depth[:, :, 0]
+                    depth_t1 = depth[:, :, 1]
+
+                    # Expand depth → fake RGB for visualization
+                    depth_t0_vis = depth_t0.repeat(1, 3, 1, 1)
+                    depth_t1_vis = depth_t1.repeat(1, 3, 1, 1)
+
+                    # If recon has depth channel
+                    if recons.shape[1] == 4:
+                        recon_rgb = recons[:, :3]
+                        recon_depth = recons[:, 3:4]
+                        recon_depth_vis = recon_depth.repeat(1, 3, 1, 1)
+                    else:
+                        recon_rgb = recons
+                        recon_depth_vis = None
+
+                    # --- Build rows ---
+
+                    row_rgb = torch.stack([rgb_t0, rgb_t1, recon_rgb], dim=1)  
+                    # (B, 3_images, 3, H, W)
+
+                    row_rgb = rearrange(row_rgb, 'b n c h w -> (b n) c h w')
+
+                    if recon_depth_vis is not None:
+                        row_depth = torch.stack([depth_t0_vis, depth_t1_vis, recon_depth_vis], dim=1)
+                    else:
+                        row_depth = torch.stack([depth_t0_vis, depth_t1_vis], dim=1)
+
+                    row_depth = rearrange(row_depth, 'b n c h w -> (b n) c h w')
+
+                    # Combine RGB + Depth rows
+                    imgs_and_recons = torch.cat([row_rgb, row_depth], dim=0)
 
                     imgs_and_recons = imgs_and_recons.detach().cpu().float().clamp(0., 1.)
-                    grid = make_grid(imgs_and_recons, nrow = 3, normalize = True, value_range = (0, 1))
+
+                    grid = make_grid(
+                        imgs_and_recons,
+                        nrow=3,              # 3 columns: t0, t1, recon
+                        normalize=True,
+                        value_range=(0, 1)
+                    )
 
                     logs['reconstructions'] = grid
-
                     save_image(grid, str(self.results_folder / f'{filename}.png'))
-
-            self.print(f'{steps}: saving to {str(self.results_folder)}')
+                    
         # save model every so often
 
         # self.accelerator.wait_for_everyone()
