@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from einops import rearrange, pack
+from einops import rearrange, pack, repeat
 from einops.layers.torch import Rearrange
 
 from laq_model.attention import Transformer, ContinuousPositionBias
@@ -18,6 +18,117 @@ def pair(val):
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
+
+
+class ContinuousLatentBottleneck(nn.Module):
+    """
+    Continuous latent action bottleneck with NSVQ-compatible interface.
+    """
+
+    def __init__(self, *, dim, quant_dim, codebook_size, code_seq_len):
+        super().__init__()
+        self.dim = dim
+        self.quant_dim = quant_dim
+        self.code_seq_len = code_seq_len
+        self.codebook_size = codebook_size
+
+        self.to_latent = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, quant_dim)
+        )
+        self.to_mu = nn.Linear(quant_dim, quant_dim)
+        self.to_logvar = nn.Linear(quant_dim, quant_dim)
+        self.to_actions = nn.Linear(quant_dim, code_seq_len * dim)
+
+        # Compatibility-only prototypes to provide stable "indices" outward.
+        self.codebook = nn.Parameter(torch.randn(codebook_size, quant_dim) * 0.02)
+        self.register_buffer("codebooks_used", torch.zeros(codebook_size, dtype=torch.int32), persistent=False)
+        self.last_kl_loss = torch.tensor(0.0)
+
+    def _encode_delta(self, input_data_first, input_data_last):
+        pooled_first = input_data_first.mean(dim=1)
+        pooled_last = input_data_last.mean(dim=1)
+        delta = pooled_last - pooled_first
+        hidden = self.to_latent(delta)
+        mu = self.to_mu(hidden)
+        logvar = self.to_logvar(hidden)
+        return mu, logvar
+
+    def _sample(self, mu, logvar, training: bool):
+        if training:
+            std = torch.exp(0.5 * logvar)
+            return mu + torch.randn_like(std) * std
+        return mu
+
+    def _decode_actions(self, latent):
+        b = latent.shape[0]
+        actions = self.to_actions(latent)
+        return actions.reshape(b, self.code_seq_len, self.dim)
+
+    def _nearest_indices(self, latent):
+        distances = torch.cdist(latent, self.codebook)
+        return torch.argmin(distances, dim=1)
+
+    def _compute_perplexity(self, indices):
+        encodings = F.one_hot(indices, num_classes=self.codebook_size).float()
+        avg_probs = encodings.mean(dim=0)
+        eps = 1e-12
+        return torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + eps)))
+
+    def forward(self, input_data_first, input_data_last, codebook_training_only=False):
+        mu, logvar = self._encode_delta(input_data_first, input_data_last)
+        latent = self._sample(mu, logvar, training=self.training and (not codebook_training_only))
+        quantized_input = self._decode_actions(latent)
+        self.last_kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+
+        nearest = self._nearest_indices(mu.detach())
+        with torch.no_grad():
+            self.codebooks_used.index_add_(
+                0,
+                nearest,
+                torch.ones_like(nearest, dtype=self.codebooks_used.dtype)
+            )
+
+        perplexity = self._compute_perplexity(nearest)
+        indices = nearest.unsqueeze(1).repeat(1, self.code_seq_len)
+        return quantized_input, perplexity, self.codebooks_used.cpu().numpy(), indices
+
+    def inference(self, input_data_first, input_data_last, user_action_token_num=None):
+        mu, _ = self._encode_delta(input_data_first, input_data_last)
+        self.last_kl_loss = torch.zeros((), device=mu.device, dtype=mu.dtype)
+
+        if user_action_token_num is not None:
+            if isinstance(user_action_token_num, list):
+                user_idx = torch.tensor(user_action_token_num, device=mu.device, dtype=torch.long)
+            else:
+                user_idx = torch.tensor([user_action_token_num], device=mu.device, dtype=torch.long)
+
+            if user_idx.numel() == 1:
+                user_idx = user_idx.repeat(mu.shape[0])
+            elif user_idx.numel() != mu.shape[0]:
+                user_idx = user_idx.flatten()[:1].repeat(mu.shape[0])
+
+            user_idx = user_idx.clamp_(0, self.codebook_size - 1)
+            latent = self.codebook[user_idx]
+            indices = user_idx.unsqueeze(1).repeat(1, self.code_seq_len)
+        else:
+            latent = mu
+            nearest = self._nearest_indices(mu.detach())
+            indices = nearest.unsqueeze(1).repeat(1, self.code_seq_len)
+
+        quantized_input = self._decode_actions(latent)
+        return quantized_input, indices
+
+    def replace_unused_codebooks(self, num_batches):
+        # No discrete codebook replacement in continuous mode.
+        return
+
+    def decode_from_indices(self, indices):
+        if indices.ndim > 1:
+            indices = indices[:, 0]
+        indices = indices.clamp_(0, self.codebook_size - 1).long()
+        latent = self.codebook[indices]
+        return self._decode_actions(latent)
 
 
 class LatentActionQuantization(nn.Module):
@@ -34,9 +145,13 @@ class LatentActionQuantization(nn.Module):
         dim_head = 64,
         heads = 8,
         channels = 3,
+        decoder_out_channels = None,
         attn_dropout = 0.,
         ff_dropout = 0.,
         code_seq_len = 1,
+        use_continuous_bottleneck = False,
+        kl_weight = 1e-4,
+        kl_warmup_steps = 0,
     ):
         """
         einstein notations:
@@ -51,6 +166,14 @@ class LatentActionQuantization(nn.Module):
         super().__init__()
 
         self.code_seq_len = code_seq_len
+        self.use_continuous_bottleneck = use_continuous_bottleneck
+        self.kl_weight = kl_weight
+        self.kl_warmup_steps = kl_warmup_steps
+        self.in_channels = channels
+        self.decoder_out_channels = channels if decoder_out_channels is None else decoder_out_channels
+        assert self.decoder_out_channels <= self.in_channels, "decoder_out_channels must be <= input channels"
+        self.last_recon_loss = None
+        self.last_kl_loss = None
         self.image_size = pair(image_size)
         self.patch_size = pair(patch_size)
         patch_height, patch_width = self.patch_size
@@ -94,29 +217,38 @@ class LatentActionQuantization(nn.Module):
         self.enc_temporal_transformer = Transformer(depth = temporal_depth, **transformer_kwargs)
 
 
-        self.vq = NSVQ(
-            dim=dim,
-            num_embeddings=codebook_size,
-            embedding_dim=quant_dim,
-            device='cuda',
-            code_seq_len=code_seq_len,
-            patch_size=patch_size,
-            image_size=image_size
-        )
+        if self.use_continuous_bottleneck:
+            self.vq = ContinuousLatentBottleneck(
+                dim=dim,
+                quant_dim=quant_dim,
+                codebook_size=codebook_size,
+                code_seq_len=code_seq_len
+            )
+        else:
+            self.vq = NSVQ(
+                dim=dim,
+                num_embeddings=codebook_size,
+                embedding_dim=quant_dim,
+                device='cuda',
+                code_seq_len=code_seq_len,
+                patch_size=patch_size,
+                image_size=image_size
+            )
             
             
         self.dec_spatial_transformer = Transformer(depth = spatial_depth, **transformer_with_action_kwargs)
         self.to_pixels_first_frame = nn.Sequential(
-            nn.Linear(dim, channels * patch_width * patch_height),
-            Rearrange('b 1 h w (c p1 p2) -> b c 1 (h p1) (w p2)', p1 = patch_height, p2 = patch_width)
+            nn.Linear(dim, self.decoder_out_channels * patch_width * patch_height),
+            Rearrange('b 1 h w (c p1 p2) -> b c 1 (h p1) (w p2)', c = self.decoder_out_channels, p1 = patch_height, p2 = patch_width)
         )
 
 
     def state_dict(self, *args, **kwargs):
         return super().state_dict(*args, **kwargs)
 
-    def load_state_dict(self, *args, **kwargs):
-        return super().load_state_dict(*args, **kwargs, strict = False)
+    def load_state_dict(self, state_dict, strict=False, assign=False):
+        # Always non-strict (VQ keys may differ between continuous/discrete).
+        return super().load_state_dict(state_dict, strict=False, assign=assign)
 
     def load(self, path):
         path = Path(path)
@@ -126,12 +258,15 @@ class LatentActionQuantization(nn.Module):
         self.load_state_dict(pt)
 
     def decode_from_codebook_indices(self, indices):
-        codes = self.vq.codebook[indices]
+        if self.use_continuous_bottleneck:
+            return self.vq.decode_from_indices(indices)
 
-        return self.decode(codes)
-
-    def codes_from_codebook_indices(self, indices):
-        return self.vq.codebook[indices]
+        codebook = self.vq.codebooks if hasattr(self.vq, "codebooks") else self.vq.codebook
+        codes = codebook[indices]
+        if codes.ndim == 3:
+            b, t, d = codes.shape
+            return codes.reshape(b, t * d)
+        return codes
 
     @property
     def patch_height_width(self):
@@ -281,13 +416,26 @@ class LatentActionQuantization(nn.Module):
         if return_recons_only:
             return returned_recon
 
+        target_video = rest_frames[:, :self.decoder_out_channels]
+
         if exists(mask):
             # variable lengthed video / images training
-            recon_loss = F.mse_loss(video, recon_video, reduction = 'none')
-            recon_loss = recon_loss[repeat(mask, 'b t -> b c t', c = c)]
+            recon_loss = F.mse_loss(target_video, recon_video, reduction = 'none')
+            recon_loss = recon_loss[repeat(mask, 'b t -> b c t', c = self.decoder_out_channels)]
             recon_loss = recon_loss.mean()
         else:
-            recon_loss = F.mse_loss(video, recon_video)
+            recon_loss = F.mse_loss(target_video, recon_video)
+
+        self.last_recon_loss = recon_loss
+        if self.use_continuous_bottleneck:
+            self.last_kl_loss = self.vq.last_kl_loss
+            if self.kl_warmup_steps > 0:
+                kl_scale = min(float(step) / float(self.kl_warmup_steps), 1.0)
+            else:
+                kl_scale = 1.0
+            recon_loss = recon_loss + (self.kl_weight * kl_scale * self.last_kl_loss)
+        else:
+            self.last_kl_loss = torch.zeros((), device=recon_loss.device, dtype=recon_loss.dtype)
 
         return recon_loss, num_unique_indices
         
@@ -298,7 +446,6 @@ class LatentActionQuantization(nn.Module):
         step = 0,
         mask = None,
         return_only_codebook_ids=False,
-        return_embeddings=False,
         user_action_token_num=None
     ):
         
@@ -340,9 +487,6 @@ class LatentActionQuantization(nn.Module):
     
         if return_only_codebook_ids:
             return indices
-
-        if return_embeddings:
-            return tokens    
 
         if math.sqrt(self.code_seq_len) % 1 == 0: # "code_seq_len should be square number"
             action_h = int(math.sqrt(self.code_seq_len))

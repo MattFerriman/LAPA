@@ -283,6 +283,10 @@ class LAQTrainer(nn.Module):
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
             accum_log(logs, {'num_unique_indices': num_unique_indices})
+            if hasattr(self.vae, 'last_recon_loss') and self.vae.last_recon_loss is not None:
+                accum_log(logs, {'recon_loss': self.vae.last_recon_loss.item() / self.grad_accum_every})
+            if hasattr(self.vae, 'last_kl_loss') and self.vae.last_kl_loss is not None:
+                accum_log(logs, {'kl_loss': self.vae.last_kl_loss.item() / self.grad_accum_every})
 
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)

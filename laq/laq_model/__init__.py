@@ -1,4 +1,3 @@
 from laq_model.latent_action_quantization import LatentActionQuantization
 from laq_model.laq_trainer import LAQTrainer
 from laq_model.laq_trainer_with_depth import LAQTrainerWithDepth
-from laq_model.laq_trainer_no_depth import LAQTrainerNoDepth

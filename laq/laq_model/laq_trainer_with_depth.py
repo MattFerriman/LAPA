@@ -306,6 +306,10 @@ class LAQTrainerWithDepth(nn.Module):
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
             accum_log(logs, {'num_unique_indices': num_unique_indices})
+            if hasattr(self.vae, 'last_recon_loss') and self.vae.last_recon_loss is not None:
+                accum_log(logs, {'recon_loss': self.vae.last_recon_loss.item() / self.grad_accum_every})
+            if hasattr(self.vae, 'last_kl_loss') and self.vae.last_kl_loss is not None:
+                accum_log(logs, {'kl_loss': self.vae.last_kl_loss.item() / self.grad_accum_every})
 
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)
@@ -350,47 +354,15 @@ class LAQTrainerWithDepth(nn.Module):
                     logs['reconstructions'] = grid
                     save_image(grid, str(self.results_folder / f'{filename}.png'))
                 else:
-                    # valid_data shape: (B, C, 2, H, W)
-                    # recons shape:     (B, C, H, W) or similar
-
+                    # For depth-enabled inputs, always visualize RGB triplets:
+                    # frame t0, frame t1, and predicted RGB.
                     rgb = valid_data[:, :3]      # (B, 3, 2, H, W)
-                    depth = valid_data[:, 3:4]   # (B, 1, 2, H, W)
-
                     rgb_t0 = rgb[:, :, 0]
                     rgb_t1 = rgb[:, :, 1]
+                    recon_rgb = recons[:, :3]
 
-                    depth_t0 = depth[:, :, 0]
-                    depth_t1 = depth[:, :, 1]
-
-                    # Expand depth → fake RGB for visualization
-                    depth_t0_vis = depth_t0.repeat(1, 3, 1, 1)
-                    depth_t1_vis = depth_t1.repeat(1, 3, 1, 1)
-
-                    # If recon has depth channel
-                    if recons.shape[1] == 4:
-                        recon_rgb = recons[:, :3]
-                        recon_depth = recons[:, 3:4]
-                        recon_depth_vis = recon_depth.repeat(1, 3, 1, 1)
-                    else:
-                        recon_rgb = recons
-                        recon_depth_vis = None
-
-                    # --- Build rows ---
-
-                    row_rgb = torch.stack([rgb_t0, rgb_t1, recon_rgb], dim=1)  
-                    # (B, 3_images, 3, H, W)
-
-                    row_rgb = rearrange(row_rgb, 'b n c h w -> (b n) c h w')
-
-                    if recon_depth_vis is not None:
-                        row_depth = torch.stack([depth_t0_vis, depth_t1_vis, recon_depth_vis], dim=1)
-                    else:
-                        row_depth = torch.stack([depth_t0_vis, depth_t1_vis], dim=1)
-
-                    row_depth = rearrange(row_depth, 'b n c h w -> (b n) c h w')
-
-                    # Combine RGB + Depth rows
-                    imgs_and_recons = torch.cat([row_rgb, row_depth], dim=0)
+                    imgs_and_recons = torch.stack([rgb_t0, rgb_t1, recon_rgb], dim=1)
+                    imgs_and_recons = rearrange(imgs_and_recons, 'b n c h w -> (b n) c h w')
 
                     imgs_and_recons = imgs_and_recons.detach().cpu().float().clamp(0., 1.)
 

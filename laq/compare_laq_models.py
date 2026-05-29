@@ -9,6 +9,9 @@ from torchvision.transforms.functional import normalize
 from PIL import Image
 import glob
 import os
+import torch.nn.functional as F
+from pytorch_msssim import ssim as compute_ssim
+import lpips
 
 from laq_model import LatentActionQuantization
 
@@ -172,10 +175,15 @@ class BridgeComparisonDatasetSingle(Dataset):
             "view2": "none",
             "frame_t_v2": 0,
             "frame_t_plus_v2": 0,
+
+            "view3": "none",
+            "frame_t_v3": 0,
+            "frame_t_plus_v3": 0,
+
             "frame_idx": i
         }
 
-        return rgb, rgbd, 0, 0, metadata
+        return rgb, rgbd, 0, 0, 0, 0, metadata
 
 class BridgeComparisonDataset(Dataset):
     def __init__(self, traj_entries, image_size=256, offset=5):
@@ -199,18 +207,10 @@ class BridgeComparisonDataset(Dataset):
             traj_path = entry["traj_path"]
             rgb_views = entry.get("rgb_views", {})
 
-            if len(rgb_views) < 2:
-                continue
-
-            if "images0" not in rgb_views:
+            if len(rgb_views) < 3:
                 continue 
 
-            view1 = "images0"
-
-            other_views = sorted([v for v in rgb_views.keys() if v != "images0"])
-            view2 = np.random.choice(other_views)
-
-            view_names = [view1, view2]
+            view_names = sorted([v for v in rgb_views.keys()])
 
             frames_per_view = {}
             depth_per_view = {}
@@ -272,10 +272,11 @@ class BridgeComparisonDataset(Dataset):
         traj_idx = index % len(self.samples)
         sample = self.samples[traj_idx]
 
-        v1, v2 = sample["views"]
+        v1, v2, v3 = sample["views"]
 
         frames1 = sample["rgb"][v1]
         frames2 = sample["rgb"][v2]
+        frames3 = sample["rgb"][v3]
 
         i = np.random.randint(0, len(frames1) - self.offset)
 
@@ -312,6 +313,7 @@ class BridgeComparisonDataset(Dataset):
 
         rgb_v1, rgbd_v1, f1_t, f1_tp = load_pair(frames1, sample["depth"][v1])
         rgb_v2, rgbd_v2, f2_t, f2_tp = load_pair(frames2, sample["depth"][v2])
+        rgb_v3, rgbd_v3, f3_t, f3_tp = load_pair(frames3, sample["depth"][v3])
 
         metadata = {
             "traj_path": sample["traj_path"],
@@ -326,11 +328,16 @@ class BridgeComparisonDataset(Dataset):
             "view2": v2,
             "frame_t_v2": f2_t,
             "frame_t_plus_v2": f2_tp,
+
+            "view3": v3,
+            "frame_t_v3": f3_t,
+            "frame_t_plus_v3": f3_tp,
+
             "frame_idx": i
         }
 
-        return rgb_v1, rgbd_v1, rgb_v2, rgbd_v2, metadata
-
+        return rgb_v1, rgbd_v1, rgb_v2, rgbd_v2, rgb_v3, rgbd_v3, metadata
+    
 
 def compare_models(
     laq_rgb, 
@@ -348,22 +355,26 @@ def compare_models(
     rows = []
 
     stats = {
-        "agreement": {
-            "ham_view_rgb": [],
-            "mse_view_rgb": [],
-            "ham_view_rgbd": [],
-            "mse_view_rgbd": [],
+        "agree": {
+            "hamming_rgb": {10: [], 20: [], 12: []},
+            "mse_view_rgb": {10: [], 20: [], 12: []},
+            "hamming_rgbd": {10: [], 20: [], 12: []},
+            "mse_view_rgbd": {10: [], 20: [], 12: []},
         },
-        "reconstruction": {
-            "rgb_v1": [],
-            "rgbd_v1": [],
-            "rgb_v2": [],
-            "rgbd_v2": [],
+        "recon": {
+            "mse_rgb": {0: [], 1: [], 2: []},
+            "mse_rgbd": {0: [], 1: [], 2: []},
+            "ssim_rgb": {0: [], 1: [], 2: []},
+            "ssim_rgbd": {0: [], 1: [], 2: []},
+            "lpips_rgb": {0: [], 1: [], 2: []},
+            "lpips_rgbd": {0: [], 1: [], 2: []},
         }
     }
 
+    lpips_fn = lpips.LPIPS(net='alex').to(device)
+
     with torch.no_grad():
-        for rgb_v1, rgbd_v1, rgb_v2, rgbd_v2, batch_meta in dataloader:
+        for rgb_v1, rgbd_v1, rgb_v2, rgbd_v2, rgb_v3, rgbd_v3, batch_meta in dataloader:
 
             if total >= max_samples:
                 break
@@ -373,6 +384,8 @@ def compare_models(
             if multiview:
                 rgb_v2 = rgb_v2.to(device)
                 rgbd_v2 = rgbd_v2.to(device)
+                rgb_v3 = rgb_v3.to(device)
+                rgbd_v3 = rgbd_v3.to(device)
 
             # ---- Forward passes ----
             codes_rgb_v1 = laq_rgb(rgb_v1, return_only_codebook_ids=True)
@@ -392,6 +405,14 @@ def compare_models(
                 emb_rgbd_v2   = laq_rgbd(rgbd_v2, return_embeddings=True)
                 recon_rgbd_v2 = laq_rgbd(rgbd_v2, return_recons_only=True)
 
+                codes_rgb_v3 = laq_rgb(rgb_v3, return_only_codebook_ids=True)
+                emb_rgb_v3   = laq_rgb(rgb_v3, return_embeddings=True)
+                recon_rgb_v3 = laq_rgb(rgb_v3, return_recons_only=True)
+
+                codes_rgbd_v3 = laq_rgbd(rgbd_v3, return_only_codebook_ids=True)
+                emb_rgbd_v3   = laq_rgbd(rgbd_v3, return_embeddings=True)
+                recon_rgbd_v3 = laq_rgbd(rgbd_v3, return_recons_only=True)
+
             # ---- Move to CPU once ----
             codes_rgb_v1  = codes_rgb_v1.cpu().numpy()
             codes_rgbd_v1 = codes_rgbd_v1.cpu().numpy()
@@ -404,6 +425,11 @@ def compare_models(
                 emb_rgb_v2    = emb_rgb_v2.cpu().numpy()
                 emb_rgbd_v2   = emb_rgbd_v2.cpu().numpy()
 
+                codes_rgb_v3  = codes_rgb_v3.cpu().numpy()
+                codes_rgbd_v3 = codes_rgbd_v3.cpu().numpy()
+                emb_rgb_v3    = emb_rgb_v3.cpu().numpy()
+                emb_rgbd_v3   = emb_rgbd_v3.cpu().numpy()
+
             batch_size = len(codes_rgb_v1)
 
             for i in range(batch_size):
@@ -415,29 +441,78 @@ def compare_models(
                 
                 if multiview:
                     # ---- View agreement (RGB v1 vs v2) ----
-                    ham_view_rgb = hamming_distance(codes_rgb_v1[i], codes_rgb_v2[i])
-                    mse_view_rgb = np.mean((emb_rgb_v1[i] - emb_rgb_v2[i]) ** 2)
+                    hamming_rgb_v12 = hamming_distance(codes_rgb_v1[i], codes_rgb_v2[i])
+                    mse_view_rgb_v12 = np.mean((emb_rgb_v1[i] - emb_rgb_v2[i]) ** 2)
 
                     # ---- View agreement (RGBD v1 vs v2) ----
-                    ham_view_rgbd = hamming_distance(codes_rgbd_v1[i], codes_rgbd_v2[i])
-                    mse_view_rgbd = np.mean((emb_rgbd_v1[i] - emb_rgbd_v2[i]) ** 2)
-                
-                recon_rgb_loss_v1 = torch.mean(
-                        (recon_rgb_v1[i] - rgb_v1[i,:,1]) ** 2
-                ).item()
+                    hamming_rgbd_v12 = hamming_distance(codes_rgbd_v1[i], codes_rgbd_v2[i])
+                    mse_view_rgbd_v12 = np.mean((emb_rgbd_v1[i] - emb_rgbd_v2[i]) ** 2)
 
-                recon_rgbd_loss_v1 = torch.mean(
-                        (recon_rgbd_v1[i] - rgbd_v1[i,:,1]) ** 2
-                ).item()
+                     # ---- View agreement (RGB v1 vs v3) ----
+                    hamming_rgb_v13 = hamming_distance(codes_rgb_v1[i], codes_rgb_v3[i])
+                    mse_view_rgb_v13 = np.mean((emb_rgb_v1[i] - emb_rgb_v3[i]) ** 2)
+
+                    # ---- View agreement (RGBD v1 vs v3) ----
+                    hamming_rgbd_v13 = hamming_distance(codes_rgbd_v1[i], codes_rgbd_v3[i])
+                    mse_view_rgbd_v13 = np.mean((emb_rgbd_v3[i] - emb_rgbd_v2[i]) ** 2)
+
+                     # ---- View agreement (RGB v2 vs v3) ----
+                    hamming_rgb_v23 = hamming_distance(codes_rgb_v2[i], codes_rgb_v3[i])
+                    mse_view_rgb_v23 = np.mean((emb_rgb_v2[i] - emb_rgb_v3[i]) ** 2)
+
+                    # ---- View agreement (RGBD v2 vs v3) ----
+                    hamming_rgbd_v23 = hamming_distance(codes_rgbd_v2[i], codes_rgbd_v3[i])
+                    mse_view_rgbd_v23 = np.mean((emb_rgbd_v2[i] - emb_rgbd_v3[i]) ** 2)
+                
+                def recon_losses_rgb(x, xhat):
+                    recon_mse = torch.mean(
+                            (xhat - x) ** 2
+                    ).item()
+
+                    # --- SSIM ---
+                    ssim_loss = compute_ssim(
+                            xhat.unsqueeze(0),
+                            x.unsqueeze(0),
+                            data_range=1.0
+                    ).item()
+    
+                    # --- LPIPS ---
+                    lpips_loss = lpips_fn(
+                            xhat.unsqueeze(0) * 2 - 1,
+                            x.unsqueeze(0) * 2 - 1
+                    ).item()
+
+                    return recon_mse, ssim_loss, lpips_loss
+                
+                def recon_losses_rgbd(x, xhat):
+                    recon_mse = torch.mean(
+                            (xhat - x) ** 2
+                    ).item()
+    
+                    # --- SSIM ---
+                    ssim_loss = compute_ssim(
+                            xhat.unsqueeze(0)[:, :3],
+                            x.unsqueeze(0)[:, :3],
+                            data_range=1.0
+                    ).item()
+
+                    # --- LPIPS ---
+                    lpips_loss = lpips_fn(
+                            xhat.unsqueeze(0)[:, :3] * 2 - 1,
+                            x.unsqueeze(0)[:, :3] * 2 - 1
+                    ).item()
+                    
+                    return recon_mse, ssim_loss, lpips_loss
+
+                mse_recon_rgb_v1, ssim_rgb_v1, lpips_rgb_v1 = recon_losses_rgb(rgb_v1[i,:,1], recon_rgb_v1[i])
+                mse_recon_rgbd_v1, ssim_rgbd_v1, lpips_rgbd_v1 = recon_losses_rgbd(rgbd_v1[i,:,1], recon_rgbd_v1[i])
 
                 if multiview:
-                    recon_rgb_loss_v2 = torch.mean(
-                            (recon_rgb_v2[i] - rgb_v2[i,:,1]) ** 2
-                    ).item()
+                    mse_recon_rgb_v2, ssim_rgb_v2, lpips_rgb_v2 = recon_losses_rgb(rgb_v2[i,:,1], recon_rgb_v2[i])
+                    mse_recon_rgbd_v2, ssim_rgbd_v2, lpips_rgbd_v2 = recon_losses_rgbd(rgbd_v2[i,:,1], recon_rgbd_v2[i])
 
-                    recon_rgbd_loss_v2 = torch.mean(
-                            (recon_rgbd_v2[i] - rgbd_v2[i,:,1]) ** 2
-                    ).item()
+                    mse_recon_rgb_v3, ssim_rgb_v3, lpips_rgb_v3 = recon_losses_rgb(rgb_v3[i,:,1], recon_rgb_v3[i])
+                    mse_recon_rgbd_v3, ssim_rgbd_v3, lpips_rgbd_v3 = recon_losses_rgbd(rgbd_v3[i,:,1], recon_rgbd_v3[i])
 
                     if vis_saved < num_vis_samples:
                         save_reconstruction_grid(
@@ -467,43 +542,110 @@ def compare_models(
                         )
                         vis_saved += 1
 
-                    recon_rgb_loss_v2 = -1
-                    recon_rgbd_loss_v2 = -1
-                    ham_view_rgb = -1
-                    mse_view_rgb = -1
-                    ham_view_rgbd = -1
-                    mse_view_rgbd = -1
+                    mse_recon_rgb_v2, ssim_rgb_v2, lpips_rgb_v2 = -1, -1, -1
+                    mse_recon_rgbd_v2, ssim_rgbd_v2, lpips_rgbd_v2 = -1, -1, -1
 
-                stats["agreement"]["ham_view_rgb"].append(ham_view_rgb)
-                stats["agreement"]["mse_view_rgb"].append(mse_view_rgb)
-                stats["agreement"]["ham_view_rgbd"].append(ham_view_rgbd)
-                stats["agreement"]["mse_view_rgbd"].append(mse_view_rgbd)
-                stats["reconstruction"]["rgb_v1"].append(recon_rgb_loss_v1)
-                stats["reconstruction"]["rgbd_v1"].append(recon_rgbd_loss_v1)
-                stats["reconstruction"]["rgb_v2"].append(recon_rgb_loss_v2)
-                stats["reconstruction"]["rgbd_v2"].append(recon_rgbd_loss_v2)
+                    mse_recon_rgb_v3, ssim_rgb_v3, lpips_rgb_v3 = -1, -1, -1
+                    mse_recon_rgbd_v3, ssim_rgbd_v3, lpips_rgbd_v3 = -1, -1, -1
 
+                    hamming_rgb_v12 = -1
+                    hamming_rgb_v13 = -1
+                    hamming_rgb_v23 = -1
+                    mse_view_rgb_v12 = -1
+                    mse_view_rgb_v13 = -1
+                    mse_view_rgb_v23 = -1
+                    hamming_rgbd_v12 = -1
+                    hamming_rgbd_v13 = -1
+                    hamming_rgbd_v23 = -1
+                    mse_view_rgbd_v12 = -1
+                    mse_view_rgbd_v13 = -1
+                    mse_view_rgbd_v23 = -1
+
+                stats["agree"]["hamming_rgb"][10].append(hamming_rgb_v12)
+                stats["agree"]["mse_view_rgb"][10].append(mse_view_rgb_v12)
+                stats["agree"]["hamming_rgbd"][10].append(hamming_rgbd_v12)
+                stats["agree"]["mse_view_rgbd"][10].append(mse_view_rgbd_v12)
+                stats["agree"]["hamming_rgb"][20].append(hamming_rgb_v13)
+                stats["agree"]["mse_view_rgb"][20].append(mse_view_rgb_v13)
+                stats["agree"]["hamming_rgbd"][20].append(hamming_rgbd_v13)
+                stats["agree"]["mse_view_rgbd"][20].append(mse_view_rgbd_v13)
+                stats["agree"]["hamming_rgb"][12].append(hamming_rgb_v23)
+                stats["agree"]["mse_view_rgb"][12].append(mse_view_rgb_v23)
+                stats["agree"]["hamming_rgbd"][12].append(hamming_rgbd_v23)
+                stats["agree"]["mse_view_rgbd"][12].append(mse_view_rgbd_v23)
+
+                stats["recon"]["mse_rgb"][0].append(mse_recon_rgb_v1)
+                stats["recon"]["mse_rgbd"][0].append(mse_recon_rgbd_v1)
+                stats["recon"]["mse_rgb"][1].append(mse_recon_rgb_v2)
+                stats["recon"]["mse_rgbd"][1].append(mse_recon_rgbd_v2)
+                stats["recon"]["mse_rgb"][2].append(mse_recon_rgb_v3)
+                stats["recon"]["mse_rgbd"][2].append(mse_recon_rgbd_v3)
+                stats["recon"]["ssim_rgb"][0].append(ssim_rgb_v1)
+                stats["recon"]["ssim_rgbd"][0].append(ssim_rgbd_v1)
+                stats["recon"]["ssim_rgb"][1].append(ssim_rgb_v2)
+                stats["recon"]["ssim_rgbd"][1].append(ssim_rgbd_v2)
+                stats["recon"]["ssim_rgb"][2].append(ssim_rgb_v3)
+                stats["recon"]["ssim_rgbd"][2].append(ssim_rgbd_v3)
+                stats["recon"]["lpips_rgb"][0].append(lpips_rgb_v1)
+                stats["recon"]["lpips_rgbd"][0].append(lpips_rgbd_v1)
+                stats["recon"]["lpips_rgb"][1].append(lpips_rgb_v2)
+                stats["recon"]["lpips_rgbd"][1].append(lpips_rgbd_v2)
+                stats["recon"]["lpips_rgb"][2].append(lpips_rgb_v3)
+                stats["recon"]["lpips_rgbd"][2].append(lpips_rgbd_v3)
 
                 row = {
+                    # --- metadata ---
                     "traj_path": meta["traj_path"],
                     "environment": meta["environment"],
                     "task": meta["task"],
                     "datetime": meta["datetime"],
-                    "view": meta["view"],
-                    "frame_t": meta["frame_t"],
-                    "frame_t_plus": meta["frame_t_plus"],
+
                     "view_v1": meta["view"],
                     "view_v2": meta["view2"],
-                    # cross view
-                    "ham_view_rgb": float(ham_view_rgb),
-                    "mse_view_rgb": float(mse_view_rgb),
-                    "ham_view_rgbd": float(ham_view_rgbd),
-                    "mse_view_rgbd": float(mse_view_rgbd),
-                    # reconstruction
-                    "recon_rgb_v1": float(recon_rgb_loss_v1),
-                    "recon_rgb_v2": float(recon_rgb_loss_v2),
-                    "recon_rgbd_v1": float(recon_rgbd_loss_v1),
-                    "recon_rgbd_v2": float(recon_rgbd_loss_v2),
+                    "view_v3": meta["view3"],
+                    "frame_t": meta["frame_t"],
+                    "frame_t_plus": meta["frame_t_plus"],
+
+                    # --- cross-view (pair-specific) ---
+                    "ham_rgb_01": float(hamming_rgb_v12),
+                    "ham_rgb_02": float(hamming_rgb_v13),
+                    "ham_rgb_12": float(hamming_rgb_v23),
+                    "ham_rgbd_01": float(hamming_rgbd_v12),
+                    "ham_rgbd_02": float(hamming_rgbd_v13),
+                    "ham_rgbd_12": float(hamming_rgbd_v23),
+
+                    "mse_view_rgb_01": float(mse_view_rgb_v12),
+                    "mse_view_rgb_02": float(mse_view_rgb_v13),
+                    "mse_view_rgb_12": float(mse_view_rgb_v23),
+                    "mse_view_rgbd_01": float(mse_view_rgbd_v12),
+                    "mse_view_rgbd_02": float(mse_view_rgbd_v13),
+                    "mse_view_rgbd_12": float(mse_view_rgbd_v23),
+
+                    # --- reconstruction RGB ---
+                    "mse_rgb_v1": float(mse_recon_rgb_v1),
+                    "ssim_rgb_v1": float(ssim_rgb_v1),
+                    "lpips_rgb_v1": float(lpips_rgb_v1),
+
+                    "mse_rgb_v2": float(mse_recon_rgb_v2),
+                    "ssim_rgb_v2": float(ssim_rgb_v2),
+                    "lpips_rgb_v2": float(lpips_rgb_v2),
+
+                    "mse_rgb_v3": float(mse_recon_rgb_v3),
+                    "ssim_rgb_v3": float(ssim_rgb_v3),
+                    "lpips_rgb_v3": float(lpips_rgb_v3),
+
+                    # --- reconstruction RGBD (as currently defined) ---
+                    "mse_rgbd_v1": float(mse_recon_rgbd_v1),
+                    "ssim_rgbd_v1": float(ssim_rgbd_v1),
+                    "lpips_rgbd_v1": float(lpips_rgbd_v1),
+        
+                    "mse_rgbd_v2": float(mse_recon_rgbd_v2),
+                    "ssim_rgbd_v2": float(ssim_rgbd_v2),
+                    "lpips_rgbd_v2": float(lpips_rgbd_v2),
+
+                    "mse_rgbd_v3": float(mse_recon_rgbd_v3),
+                    "ssim_rgbd_v3": float(ssim_rgbd_v3),
+                    "lpips_rgbd_v3": float(lpips_rgbd_v3),
                 }
 
                 for j, code in enumerate(codes_rgb_v1[i]):
@@ -518,6 +660,12 @@ def compare_models(
 
                     for j, code in enumerate(codes_rgbd_v2[i]):
                         row[f"rgbd_v2_d{j}"] = int(code)
+
+                    for j, code in enumerate(codes_rgb_v3[i]):
+                        row[f"rgb_v3_d{j}"] = int(code)
+
+                    for j, code in enumerate(codes_rgbd_v3[i]):
+                        row[f"rgbd_v3_d{j}"] = int(code)
 
                 rows.append(row)
 
@@ -620,6 +768,8 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--val_meta", type=str, required=True)
+    parser.add_argument("--train_meta", type=str, required=True)
+    parser.add_argument("--all_meta", type=str, required=True)
     parser.add_argument("--rgb_ckpt", type=str, required=True)
     parser.add_argument("--rgbd_ckpt", type=str, required=True)
     parser.add_argument("--codebook_size", type=int, required=True)
@@ -636,61 +786,132 @@ def main():
 
     with open(args.val_meta, "r") as f:
         val_entries = json.load(f)
+    
+    with open(args.train_meta, "r") as f:
+        train_entries = json.load(f)
 
-    envs = ["toykitchen1", "toykitchen2", "toykitchen5", "toykitchen7"]
+    with open(args.all_meta, "r") as f:
+        all_entries = json.load(f)
 
-    in_dist_entries = [
+    def create_dataloader(entries):
+        ds = BridgeComparisonDataset(entries, offset=args.offset)
+
+        dl = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4
+        )
+        return dl
+
+    tk1_entries = [
         t for t in val_entries
-        if t["environment"] in envs
+        if t["environment"] == "toykitchen1"
+    ]
+
+    tk1_loader = create_dataloader(tk1_entries)
+
+    print("ID toykitchen1 validation entries: ", len(tk1_entries))
+
+    tk1_train_entries = [
+        t for t in train_entries
+        if t["environment"] == "toykitchen1"
+    ]
+
+    tk1_train_loader = create_dataloader(tk1_train_entries)
+
+    print("ID toykitchen1 train entries: ", len(tk1_train_entries))
+
+    tk2_entries = [
+        t for t in val_entries
+        if t["environment"] == "toykitchen2"
     ]
     
-    in_dist_dataset = BridgeComparisonDataset(in_dist_entries, offset=args.offset)
+    tk2_loader = create_dataloader(tk2_entries)
 
-    in_dist_loader = DataLoader(
-        in_dist_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4
-    )
+    print("ID toykitchen2 validation entries: ", len(tk2_entries))
 
-    print("ID validation entries: ", len(in_dist_entries))
+    tk2_train_entries = [
+        t for t in train_entries
+        if t["environment"] == "toykitchen2"
+    ]
+
+    tk2_train_loader = create_dataloader(tk2_train_entries)
+
+    print("ID toykitchen2 train entries: ", len(tk2_train_entries))
+
+    tk5_entries = [
+        t for t in val_entries
+        if t["environment"] == "toykitchen5"
+    ]
+
+    tk5_loader = create_dataloader(tk5_entries)
+
+    print("ID toykitchen5 validation entries: ", len(tk5_entries))
+
+    tk5_train_entries = [
+        t for t in train_entries
+        if t["environment"] == "toykitchen5"
+    ]
+
+    tk5_train_loader = create_dataloader(tk5_train_entries)
+
+    print("ID toykitchen5 train entries: ", len(tk5_train_entries))
+
+    tk7_entries = [
+        t for t in val_entries
+        if t["environment"] == "toykitchen7"
+    ]
+
+    tk7_loader = create_dataloader(tk7_entries)
+
+    print("ID toykitchen7 validation entries: ", len(tk7_entries))
+    
+    tk7_train_entries = [
+        t for t in train_entries
+        if t["environment"] == "toykitchen7"
+    ]
+
+    tk7_train_loader = create_dataloader(tk7_train_entries)
+
+    print("ID toykitchen7 train entries: ", len(tk7_train_entries))
 
     ood_env_entries = [
-        t for t in val_entries
+        t for t in all_entries
         if t["environment"] == "toykitchen6"
     ]
 
-    ood_env_dataset = BridgeComparisonDataset(ood_env_entries, offset=args.offset)
-
-    ood_env_loader = DataLoader(
-        ood_env_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4
-    )
+    ood_env_loader = create_dataloader(ood_env_entries)
 
     print("OOD environment entries: ", len(ood_env_entries))
 
-    ood_emb_entries = [
-        t for t in val_entries
-        if t["environment"] in ["dt_toykitchen1", "dt_toykitchen2"]
-    ]
+    # ood_emb_entries = [
+    #     t for t in all_entries
+    #     if t["environment"] == "dt_toykitchen2"
+    # ]
 
-    ood_emb_dataset = BridgeComparisonDatasetSingle(ood_emb_entries, offset=args.offset)
+    # ood_emb_dataset = BridgeComparisonDatasetSingle(ood_emb_entries, offset=args.offset)
 
-    ood_emb_loader = DataLoader(
-        ood_emb_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4
-    )
+    # ood_emb_loader = DataLoader(
+    #     ood_emb_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=4
+    # )
 
-    print("OOD embodiment entries: ", len(ood_emb_entries))
+    # print("OOD embodiment entries: ", len(ood_emb_entries))
 
     dataloaders = {
-        'In_dist' : in_dist_loader,
-        'OOD_env' : ood_env_loader,
-        'OOD_emb' : ood_emb_loader
+        'Val_tk1' : tk1_loader,
+        'Val_tk2' : tk2_loader,
+        'Val_tk5' : tk5_loader,
+        'Val_tk7' : tk7_loader,
+        'Train_tk1' : tk1_train_loader,
+        'Train_tk2' : tk2_train_loader,
+        'Train_tk5' : tk5_train_loader,
+        'Train_tk7' : tk7_train_loader,
+        'OOD_env' : ood_env_loader
+        # 'OOD_emb' : ood_emb_loader
     }
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -755,14 +976,31 @@ def main():
         )
 
         print(f"\n--- {dataset_name} ---")
+        #for group_name, group in stats.items():
+        #    print(f"\n{group_name.upper()}")
+        #    for metric_name, values in group.items():
+        #        print(
+        #            f"{metric_name}: "
+        #            f"mean={np.mean(values):.4f}, "
+        #            f"std={np.std(values):.4f}"
+        #        )
+
         for group_name, group in stats.items():
             print(f"\n{group_name.upper()}")
-            for metric_name, values in group.items():
-                print(
-                    f"{metric_name}: "
-                    f"mean={np.mean(values):.4f}, "
-                    f"std={np.std(values):.4f}"
-                )
+
+            for metric_name, metric_dict in group.items():
+
+                # metric_dict is now a dict: key -> list
+                for key, values in metric_dict.items():
+
+                    if len(values) == 0:
+                        continue
+
+                    print(
+                        f"{metric_name}[{key}]: "
+                        f"mean={np.mean(values):.4f}, "
+                        f"std={np.std(values):.4f}"
+                    )
 
         # Tag each row with dataset name
         with open(json_path, "w") as f_json:
